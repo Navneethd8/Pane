@@ -174,7 +174,7 @@ async function readKeychainToken(): Promise<string | null> {
 }
 
 /** Cursor's stored login. The token is not written, logged, or copied into Pane's database. */
-export async function readCursorAuth(): Promise<CursorAuth | null> {
+async function readCursorAuth(): Promise<CursorAuth | null> {
   const fromDb = readStateDbAuth(cursorStateDbPath());
   if (fromDb) return fromDb;
   const token = await readKeychainToken();
@@ -196,7 +196,7 @@ function cursorCliChatsRoot(): string {
  * Chat ids the Cursor CLI wrote for a Pane worktree.
  * `agent` launches never go through create-chat, so they are not on the panel.
  */
-export function listCursorCliChats(
+function listCursorCliChats(
   worktreePaths: readonly string[],
   chatsRoot: string,
 ): PaneCursorChat[] {
