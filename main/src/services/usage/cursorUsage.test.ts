@@ -3,6 +3,7 @@ import { tmpdir } from 'os';
 import { join } from 'path';
 import { describe, expect, it } from 'vitest';
 import Database from 'better-sqlite3-multiple-ciphers';
+import type { JsonValue } from '../../../../shared/validation/boundaryDecoder';
 import {
   cursorCliWorkspaceHash,
   listPaneCursorChats,
@@ -16,7 +17,7 @@ import {
 const CHAT_ID = '8ff011fb-7f01-4e74-bbe1-e026d47ea50f';
 const OTHER_ID = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
 
-function jsonResponse(body: unknown, status = 200): Response {
+function jsonResponse(body: JsonValue, status = 200): Response {
   return new Response(JSON.stringify(body), {
     status,
     headers: { 'Content-Type': 'application/json' },

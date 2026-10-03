@@ -12,7 +12,14 @@ import {
   type UsageEvent,
   type UsageRateLimitSample,
 } from '../../../../shared/types/usage';
-import { boundary, decodeBoundary, type JsonObject, type JsonValue } from '../../../../shared/validation/boundaryDecoder';
+import {
+  boundary,
+  decodeBoundary,
+  decodeOptionalBoundary,
+  type BoundarySchema,
+  type JsonObject,
+  type JsonValue,
+} from '../../../../shared/validation/boundaryDecoder';
 import type { UsageRepository } from './usageRepository';
 
 const execFileAsync = promisify(execFile);
@@ -74,31 +81,44 @@ export function normalizeCursorModelId(model: string): string {
   return withoutVendor.replace(/-(?:xhigh|medium|high|low)(?=-|$)/g, '');
 }
 
-function asCount(value: JsonValue | undefined): number {
-  if (typeof value === 'number' && Number.isFinite(value)) return Math.max(0, Math.round(value));
-  if (typeof value === 'string' && value.trim().length > 0) {
-    const parsed = Number(value);
-    if (Number.isFinite(parsed)) return Math.max(0, Math.round(parsed));
-  }
-  return 0;
+const numericText = boundary.union(boundary.number, boundary.string);
+
+function finiteNumber(value: number | string | undefined): number | null {
+  if (value === undefined) return null;
+  const numeric = decodeOptionalBoundary(value, boundary.number);
+  const raw = numeric ?? Number(String(value));
+  return Number.isFinite(raw) ? raw : null;
 }
 
-function asPercent(value: JsonValue | undefined): number | null {
-  if (value === undefined || value === null) return null;
-  const parsed = typeof value === 'number' ? value : typeof value === 'string' ? Number(value) : NaN;
-  if (!Number.isFinite(parsed)) return null;
-  return Math.max(0, Math.min(100, parsed));
+function countFrom(value: JsonValue | undefined): number {
+  const raw = finiteNumber(decodeOptionalBoundary(value, numericText));
+  if (raw === null) return 0;
+  return Math.max(0, Math.round(raw));
 }
 
-function asTimestampMs(value: JsonValue | undefined): number | null {
-  const raw = typeof value === 'number' || typeof value === 'string' ? Number(value) : NaN;
-  if (!Number.isFinite(raw) || raw <= 0) return null;
+function percentFrom(value: JsonValue | undefined): number | null {
+  const raw = finiteNumber(decodeOptionalBoundary(value, numericText));
+  if (raw === null) return null;
+  return Math.max(0, Math.min(100, raw));
+}
+
+function timestampMsFrom(value: number | string | undefined): number | null {
+  const raw = finiteNumber(value);
+  if (raw === null || raw <= 0) return null;
   return raw > 1e12 ? raw : raw * 1000;
 }
 
-function asObject(value: JsonValue | undefined): JsonObject | null {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
-  return value;
+const sqliteText: BoundarySchema<string> = {
+  decode(current) {
+    const text = decodeOptionalBoundary(current.value, boundary.string);
+    if (text !== undefined) return text;
+    if (Buffer.isBuffer(current.value)) return current.value.toString('utf8');
+    return current.fail('expected sqlite text');
+  },
+};
+
+function jsonObjectFrom(value: JsonValue | null | undefined): JsonObject | null {
+  return decodeOptionalBoundary(value ?? undefined, boundary.jsonObject) ?? null;
 }
 
 function cursorStateDbPath(): string {
@@ -119,11 +139,13 @@ function readStateDbAuth(path: string): CursorAuth | null {
   try {
     db = new Database(path, { readonly: true, fileMustExist: true });
     const read = db.prepare('SELECT value FROM ItemTable WHERE key = ?');
-    const tokenRow = read.get('cursorAuth/accessToken') as { value?: unknown } | undefined;
-    const token = stringifyDbValue(tokenRow?.value);
+    const cell = boundary.object({
+      value: boundary.optional(boundary.nullable(sqliteText)),
+    });
+    const token = readStoredText(decodeOptionalBoundary(read.get('cursorAuth/accessToken'), cell)?.value);
     if (!token) return null;
-    const planRow = read.get('cursorAuth/stripeMembershipType') as { value?: unknown } | undefined;
-    return { accessToken: token, planType: stringifyDbValue(planRow?.value) };
+    const planType = readStoredText(decodeOptionalBoundary(read.get('cursorAuth/stripeMembershipType'), cell)?.value);
+    return { accessToken: token, planType };
   } catch {
     return null;
   } finally {
@@ -131,13 +153,10 @@ function readStateDbAuth(path: string): CursorAuth | null {
   }
 }
 
-function stringifyDbValue(value: unknown): string | null {
-  if (typeof value === 'string') {
-    const trimmed = value.trim().replace(/^"|"$/g, '');
-    return trimmed.length > 0 ? trimmed : null;
-  }
-  if (Buffer.isBuffer(value)) return stringifyDbValue(value.toString('utf8'));
-  return null;
+function readStoredText(value: string | null | undefined): string | null {
+  if (!value) return null;
+  const trimmed = value.trim().replace(/^"|"$/g, '');
+  return trimmed.length > 0 ? trimmed : null;
 }
 
 async function readKeychainToken(): Promise<string | null> {
@@ -203,31 +222,33 @@ export function listCursorCliChats(
 }
 
 function listSessionWorktrees(db: DatabaseHandle): string[] {
-  const rows = db.prepare(`
+  const rows = decodeBoundary(db.prepare(`
     SELECT DISTINCT worktree_path AS cwd
     FROM sessions
     WHERE typeof(worktree_path) = 'text' AND length(worktree_path) > 0
-  `).all() as Array<{ cwd: unknown }>;
-  return rows.flatMap(row => (typeof row.cwd === 'string' ? [row.cwd] : []));
+  `).all(), boundary.array(boundary.object({ cwd: boundary.string })));
+  return rows.map(row => row.cwd);
 }
 
 /** Chat ids Pane captured at Cursor launch, including archived Panes that still have their panels. */
 export function listPaneCursorChats(db: DatabaseHandle, chatsRoot = cursorCliChatsRoot()): PaneCursorChat[] {
-  const rows = db.prepare(`
+  const rows = decodeBoundary(db.prepare(`
     SELECT json_extract(tp.state, '$.customState.agentSessionId') AS chat_id,
            s.worktree_path AS cwd
     FROM tool_panels tp
     JOIN sessions s ON s.id = tp.session_id
     WHERE json_extract(tp.state, '$.customState.agentType') = 'cursor'
     ORDER BY s.updated_at DESC
-  `).all() as Array<{ chat_id: unknown; cwd: unknown }>;
+  `).all(), boundary.array(boundary.object({
+    chat_id: boundary.nullable(boundary.string),
+    cwd: boundary.nullable(boundary.string),
+  })));
 
   const chats = new Map<string, string>();
   for (const row of rows) {
-    if (typeof row.chat_id !== 'string' || row.chat_id.trim().length === 0) continue;
-    const chatId = row.chat_id.trim();
-    if (chats.has(chatId)) continue;
-    chats.set(chatId, typeof row.cwd === 'string' ? row.cwd : '');
+    const chatId = row.chat_id?.trim() ?? '';
+    if (chatId.length === 0 || chats.has(chatId)) continue;
+    chats.set(chatId, row.cwd ?? '');
   }
   for (const chat of listCursorCliChats(listSessionWorktrees(db), chatsRoot)) {
     if (!chats.has(chat.chatId)) chats.set(chat.chatId, chat.cwd);
@@ -235,38 +256,49 @@ export function listPaneCursorChats(db: DatabaseHandle, chatsRoot = cursorCliCha
   return [...chats.entries()].map(([chatId, cwd]) => ({ chatId, cwd }));
 }
 
-function rawUsageRowCount(payload: JsonValue): number {
-  const body = asObject(payload);
+const usageEventRow = boundary.object({
+  timestamp: boundary.optional(numericText),
+  model: boundary.optional(boundary.string),
+  conversationId: boundary.optional(boundary.string),
+  tokenUsage: boundary.optional(boundary.jsonObject),
+});
+
+function eventRowsFrom(body: JsonObject): JsonValue[] | null {
+  return decodeOptionalBoundary(body.usageEventsDisplay, boundary.array(boundary.json))
+    ?? decodeOptionalBoundary(body.usageEvents, boundary.array(boundary.json))
+    ?? null;
+}
+
+function rawUsageRowCount(payload: JsonValue | null): number {
+  const body = jsonObjectFrom(payload);
   if (!body) return 0;
-  const rows = body.usageEventsDisplay ?? body.usageEvents;
-  return Array.isArray(rows) ? rows.length : 0;
+  return eventRowsFrom(body)?.length ?? 0;
 }
 
 export function parseFilteredUsageEvents(payload: JsonValue): FilteredUsageEvent[] {
-  const body = asObject(payload);
+  const body = jsonObjectFrom(payload);
   if (!body) return [];
-  const rows = body.usageEventsDisplay ?? body.usageEvents;
-  if (!Array.isArray(rows)) {
-    const total = body.totalUsageEventsCount;
-    if ('usageEventsDisplay' in body || 'usageEvents' in body || Object.keys(body).length === 0) return [];
-    if (total === 0 || total === '0') return [];
+  const rows = eventRowsFrom(body);
+  if (!rows) {
+    const total = decodeOptionalBoundary(body.totalUsageEventsCount, numericText);
+    const namedList = 'usageEventsDisplay' in body || 'usageEvents' in body;
+    if (namedList || Object.keys(body).length === 0 || total === 0 || total === '0') return [];
     throw new Error('Cursor usage response did not include events');
   }
 
   const events: FilteredUsageEvent[] = [];
   for (const row of rows) {
-    const record = asObject(row);
+    const record = decodeOptionalBoundary(row, usageEventRow);
     if (!record) continue;
-    const conversationId = typeof record.conversationId === 'string' ? record.conversationId.trim() : '';
-    const timestampMs = asTimestampMs(record.timestamp);
-    const model = typeof record.model === 'string' ? normalizeCursorModelId(record.model) : '';
+    const conversationId = record.conversationId?.trim() ?? '';
+    const timestampMs = timestampMsFrom(record.timestamp);
+    const model = record.model ? normalizeCursorModelId(record.model) : '';
     if (!conversationId || timestampMs === null || !model) continue;
 
-    const usage = asObject(record.tokenUsage);
-    const inputTokens = asCount(usage?.inputTokens);
-    const outputTokens = asCount(usage?.outputTokens);
-    const cacheReadTokens = asCount(usage?.cacheReadTokens);
-    const cacheCreationTokens = asCount(usage?.cacheWriteTokens);
+    const inputTokens = countFrom(record.tokenUsage?.inputTokens);
+    const outputTokens = countFrom(record.tokenUsage?.outputTokens);
+    const cacheReadTokens = countFrom(record.tokenUsage?.cacheReadTokens);
+    const cacheCreationTokens = countFrom(record.tokenUsage?.cacheWriteTokens);
     if (inputTokens + outputTokens + cacheReadTokens + cacheCreationTokens === 0) continue;
 
     events.push({
@@ -324,26 +356,32 @@ export function mapCursorPeriodLimits(
   planType: string | null,
   capturedAtMs: number,
 ): UsageRateLimitSample[] {
-  const body = asObject(period ?? undefined);
-  const planUsage = asObject(body?.planUsage);
-  if (!body || !planUsage) return [];
+  const body = decodeOptionalBoundary(period ?? undefined, boundary.object({
+    billingCycleStart: boundary.optional(numericText),
+    billingCycleEnd: boundary.optional(numericText),
+    planUsage: boundary.optional(boundary.object({
+      autoPercentUsed: boundary.optional(boundary.json),
+      apiPercentUsed: boundary.optional(boundary.json),
+    })),
+  }));
+  if (!body?.planUsage) return [];
 
-  const cycleStart = asTimestampMs(body.billingCycleStart);
-  const cycleEnd = asTimestampMs(body.billingCycleEnd);
+  const cycleStart = timestampMsFrom(body.billingCycleStart);
+  const cycleEnd = timestampMsFrom(body.billingCycleEnd);
   const windowMinutes = cycleStart !== null && cycleEnd !== null && cycleEnd > cycleStart
     ? Math.round((cycleEnd - cycleStart) / 60_000)
     : null;
 
   const meters: Array<{ id: string; name: string; scope: 'primary' | 'secondary'; value: JsonValue | undefined }> = [
-    { id: 'auto', name: 'Auto', scope: 'primary', value: planUsage.autoPercentUsed },
-    { id: 'api', name: 'API', scope: 'secondary', value: planUsage.apiPercentUsed },
+    { id: 'auto', name: 'Auto', scope: 'primary', value: body.planUsage.autoPercentUsed },
+    { id: 'api', name: 'API', scope: 'secondary', value: body.planUsage.apiPercentUsed },
   ];
 
   return meters.flatMap(meter => {
-    const usedPercent = asPercent(meter.value);
+    const usedPercent = percentFrom(meter.value);
     if (usedPercent === null) return [];
     return [{
-      provider: 'cursor' as const,
+      provider: 'cursor',
       limitId: meter.id,
       scope: meter.scope,
       usedPercent: Math.max(0, Math.min(100, usedPercent)),
@@ -411,7 +449,7 @@ export async function loadCursorWindow(
     events.push(...pageEvents);
     // Skipped rows (no tokens) must not end the scan. A short raw page does.
     if (rawUsageRowCount(response.payload) < PAGE_SIZE) {
-      return { status: 'ok', window: { events, period: asObject(period.payload ?? undefined) } };
+      return { status: 'ok', window: { events, period: jsonObjectFrom(period.payload) } };
     }
   }
   throw new Error('Cursor usage event pages exceeded the cap');
@@ -434,17 +472,14 @@ export async function syncCursorUsage(
   // commit the marker before any Pane chat is reached, and the 48h window
   // would never go back for those older events.
   const chats = listPaneCursorChats(db);
-  const storedCursorEvents = db.prepare(
+  const storedCursorEvents = decodeOptionalBoundary(db.prepare(
     'SELECT COUNT(*) AS count FROM usage_events WHERE provider = ?',
-  ).get('cursor') as { count: number } | undefined;
-  const storedSessionIds = new Set(
-    (db.prepare(`
-      SELECT DISTINCT agent_session_id AS id
-      FROM usage_events
-      WHERE provider = ? AND agent_session_id IS NOT NULL
-    `).all('cursor') as Array<{ id: unknown }>)
-      .flatMap(row => (typeof row.id === 'string' ? [row.id] : [])),
-  );
+  ).get('cursor'), boundary.object({ count: boundary.number }));
+  const storedSessionIds = new Set(decodeBoundary(db.prepare(`
+    SELECT DISTINCT agent_session_id AS id
+    FROM usage_events
+    WHERE provider = ? AND agent_session_id IS NOT NULL
+  `).all('cursor'), boundary.array(boundary.object({ id: boundary.string }))).map(row => row.id));
   const missingChat = chats.some(chat => !storedSessionIds.has(chat.chatId));
   const hasSynced = repository.getFileCursor(CURSOR_USAGE_SOURCE) !== null
     && (storedCursorEvents?.count ?? 0) > 0

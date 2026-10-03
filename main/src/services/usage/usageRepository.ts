@@ -368,6 +368,7 @@ export class UsageRepository {
       );
       if (options.keepSessionIds) {
         const keep = new Set(options.keepSessionIds);
+        // SAFETY: This SELECT returns the usage_events primary key and nullable session id.
         const stale = this.db.prepare(`
           SELECT id, agent_session_id FROM usage_events WHERE provider = ?
         `).all(options.provider) as Array<{ id: string; agent_session_id: string | null }>;

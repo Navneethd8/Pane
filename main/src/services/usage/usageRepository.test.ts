@@ -235,6 +235,7 @@ describe('UsageRepository.replaceProviderWindow', () => {
       parserVersion: 4,
     });
 
+    // SAFETY: SELECT id returns the usage_events primary key.
     const rows = db.prepare('SELECT id FROM usage_events ORDER BY timestamp_ms').all() as Array<{ id: string }>;
     expect(rows.map(row => row.id)).toEqual(['outside', 'cursor:fresh']);
     expect(repo.getFileCursor(CURSOR_USAGE_SOURCE)?.provider).toBe('cursor');
@@ -271,6 +272,7 @@ describe('UsageRepository.replaceProviderWindow', () => {
       keepSessionIds: ['chat-1'],
     });
 
+    // SAFETY: SELECT id returns the usage_events primary key.
     const rows = db.prepare('SELECT id FROM usage_events ORDER BY id').all() as Array<{ id: string }>;
     expect(rows.map(row => row.id)).toEqual(['cursor:kept']);
   });
